@@ -1,4 +1,7 @@
 # pyright: reportGeneralTypeIssues=false
+# TODO: set limits on starts, friend can start only /start, 
+# make app working on phone, after 20 minutes turn off server 
+# setup counter for it
 from dotenv import load_dotenv
 import os
 import subprocess
@@ -10,6 +13,8 @@ import asyncio
 import socket
 import ping3
 from datetime import datetime, time
+import wakeonlan
+from logger import log
 
 with open("/data/mc-server/config.yaml", "r") as f:
     config = yaml.safe_load(f)
@@ -23,6 +28,10 @@ MIKROTIK_PASS: str | None = os.getenv('MIKROTIK_PASS')
 
 if DISCORD_TOKEN is None:
     raise ValueError('DISCORD_TOKEN environment variable is not set')
+
+OWNER_ID: str | None = config.get('permissions', {}).get('owner_id')
+if not OWNER_ID or OWNER_ID == "YOUR_DISCORD_USER_ID_HERE":
+    log.warning("Owner ID not set in config.yaml — /stop will be unavailable")
 
 intents: discord.Intents = discord.Intents.default()
 intents.message_content = True
@@ -54,6 +63,7 @@ class Server:
 
     def _rcon(self, command: str) -> str:
         """Send a command to the MC server via mcrcon CLI."""
+        # WARN: not sure about that bash func mcrcon if will work like this
         try:
             result = subprocess.run(
                 [
@@ -72,17 +82,19 @@ class Server:
 
     def _is_within_schedule(self) -> bool:
         """Return True if current time is within the allowed schedule window."""
+        # TODO: this should do a script
+
         now = datetime.now()
-        weekday = now.weekday()  # 0=Mon, 6=Sun
+        weekday = now.weekday()   # 0=Mon, 6=Sun
         is_weekend = weekday >= 5
 
         schedule = config['schedule']['weekend'] if is_weekend else config['schedule']['weekday']
-        if not schedule['enabled']:
-            return False
-
-        start = datetime.strptime(schedule['start_time'], "%H:%M").time()
         shutdown = datetime.strptime(schedule['shutdown_time'], "%H:%M").time()
+        start = datetime.strptime(schedule['start_time'], "%H:%M").time()
         current = now.time()
+
+        if not schedule['enabled']:
+            return True
 
         # Handle overnight window e.g. 08:00 - 02:00 (weekend)
         if shutdown < start:
@@ -91,94 +103,105 @@ class Server:
 
     def _should_shutdown_pc(self) -> bool:
         """Return True if current time is past the shutdown_time (PC should turn off)."""
-        now = datetime.now()
-        weekday = now.weekday()
-        is_weekend = weekday >= 5
-
-        schedule = config['schedule']['weekend'] if is_weekend else config['schedule']['weekday']
-        shutdown = datetime.strptime(schedule['shutdown_time'], "%H:%M").time()
-        current = now.time()
-
         # After shutdown_time means outside the allowed window
-        return not self._is_within_schedule()
+        if self._is_within_schedule():
+            return False
+        else: 
+            return True
 
     # ─── Status ─────────────────────────────────────────────────────────────────
 
     def is_running(self) -> bool:
         """Check if the PC is reachable via ping."""
+        # TODO: this should do a script
         host = config['network']['server_local_ip']
         try:
             response = ping3.ping(host, timeout=2)
             return response is not None and response is not False
         except Exception as e:
-            print(f"Excection : {e}")
+            log.error(f"Excection : {e}")
             return False
 
     def is_mc_running(self) -> bool:
         """Check if the Minecraft server is accepting connections on its port."""
-        host = config['network']['server_local_ip']
-        port = config['network']['minecraft_port']
         try:
-            sock = socket.create_connection((host, port), timeout=3)
-            sock.close()
-            return True
-        except OSError:
+            if self._run_script("mc-status.sh") == "Online":
+                return True
+            else:
+                return False
+
+        except Exception as e:
+            log.error(f"Excection : {e}")
             return False
 
     def get_players(self) -> list[str]:
-        # TODO: if no players playing, then show timer when mc server will shutdown
-        response = self._rcon("list")
-        if response.startswith("error:") or not response:
+        output = self._run_script("get-players.sh")
+        if not output or output.startswith("error"):
             return []
-        # Response format: "There are X of a max of Y players online: player1, player2"
-        if ":" in response:
-            players_part = response.split(":")[-1].strip()
-            if players_part:
-                return [p.strip() for p in players_part.split(",") if p.strip()]
-        return []
+        return [p.strip() for p in output.split("\n") if p.strip()] 
 
     def can_user_start(self, user_id: str) -> bool:
         count = self._start_counts.get(user_id, 0)
         return count < self.MAX_STARTS_PER_DAY
 
+        # TODO: this should work before deploying
     def record_start(self, user_id: str) -> None:
-        print(f"User {user_id}")
+        log.info(f"User {user_id}")
         self._start_counts[user_id] = self._start_counts.get(user_id, 0) + 1
 
-    def get_status(self) -> str:
-        if not self.is_running():
-            return "offline"
-        if not self.is_mc_running():
-            return "pc online, mc starting..."
-        return f"online"
+    def get_status(self) -> bool:
+        if self.is_running():
+            return True 
+        else:
+            return False
+
+    def mc_status(self) -> bool:
+        if self.is_mc_running():
+            return True
+        else: 
+            return False
 
     # ─── Start ──────────────────────────────────────────────────────────────────
 
     def send_wol(self) -> None:
-        connection = routeros_api.RouterOsApiPool(
-            MIKROTIK_HOST,
-            username=MIKROTIK_USER,
-            password=MIKROTIK_PASS,
-            port=8728,
-            plaintext_login=True
-        )
-        api = connection.get_api()
-        api.get_resource('/system/script').call('run', {'number': 'send-wol'})
-        connection.disconnect()
+        # WARN: didnt test yet
+        try:
+            wakeonlan.send_magic_packet('6C:62:6D:E9:8F:F5')
+            log.info("✅ WoL packet sent directly")
+        except Exception as e:
+            log.error(f"❌ WoL failed: {e}")
+
+
+    def start_mc(self) -> None:
+        """Kill any existing tmux session and start the MC server via Docker."""
+        # TODO: this should do a script
+        docker_start = config['docker']['start_command']
+        try:
+            result = subprocess.run(
+                docker_start,
+                shell=True,
+                timeout=30,
+                capture_output=True,
+                text=True
+            )
+            
+            if result.returncode == 0:
+                log.info("✅ MC server started successfully")
+            else:
+                log.error(f"❌ Command failed with exit code {result.returncode}")
+                log.error(f"stdout: {result.stdout}")
+                log.error(f"stderr: {result.stderr}")
+                
+        except subprocess.TimeoutExpired:
+            log.error("❌ Start command timed out after 30s")
+        except Exception as e:
+            log.error(f"❌ Failed to start MC: {e}")
 
     def wol(self) -> None:
         try:
             self.send_wol()
         except Exception as e:
-            print(f"❌ WoL failed: {e}")
-
-    def start_mc(self) -> None:
-        """Kill any existing tmux session and start the MC server via Docker."""
-        docker_start = config['docker']['start_command']
-        try:
-            subprocess.run(docker_start, shell=True, timeout=30)
-        except Exception as e:
-            print(f"❌ Failed to start MC: {e}")
+            log.error(f"❌ WoL failed: {e}")
 
     async def start(self, status_callback=None) -> None:
         """WoL → wait for PC to boot → start MC server."""
@@ -216,15 +239,17 @@ class Server:
         """Shut down the PC via SSH or a script. Ensures MC is stopped first."""
         if self.is_mc_running():
             self.stop_mc()
-        self._run_script("shutdown_pc.sh")
+        # TODO: shutdown script
+        self._run_script("shutdown.sh")
 
     def stop_mc(self) -> None:
         """Stop only the MC Docker container."""
+        # TODO: make a script for it
         docker_stop = config['docker']['stop_command']
         try:
             subprocess.run(docker_stop, shell=True, timeout=60)
         except Exception as e:
-            print(f"❌ Failed to stop MC: {e}")
+            log.error(f"❌ Failed to stop MC: {e}")
 
     def stop(self) -> None:
         """
@@ -234,91 +259,88 @@ class Server:
         """
         self.stop_mc()
         if self._should_shutdown_pc():
-            print("🕒 Outside schedule window — shutting down PC too.")
+            log.info("🕒 Outside schedule window — shutting down PC too.")
             self.shutdown_pc()
 
 server = Server()
 
 @client.event
 async def on_ready() -> None:
-    print(f'We have logged in as {client.user}')
+    log.info(f'We have logged in as {client.user}')
+
+def is_owner(user_id: str) -> bool:
+    """Check if the given user ID matches the configured owner."""
+    return OWNER_ID is not None and str(user_id) == str(OWNER_ID)
+
 
 @client.event
 async def on_message(message: discord.Message) -> None:
-    username = str(message.author).split("#")[0]
+    username = str(message.author.display_name)
     channel = str(message.channel.name)
     user_message = str(message.content)
-    print(f'Message {user_message} by {username} on {channel}')
+    log.debug(f'Message {user_message} by {username} on {channel}')
 
     if message.author == client.user:
         return
 
     if channel == "server":
         if user_message.lower() == "/start":
+            if not config.get('can_server_run', True):
+                await message.channel.send('Server cannot be runned right now, try again later')
+                return
+
             if not server.can_user_start(str(message.author.id)):
                 # send msg that user reached day limit
                 await message.channel.send(f'❌ {username}, you have reached your daily start limit ({server.MAX_STARTS_PER_DAY}x).')
                 return
             server.record_start(str(message.author.id))
             
-            status: str = server.get_status()
+            
+            if server.get_status():
+                await message.channel.send('🖥️ Server is currently **online**.')
 
-            # NOTE: server is offline, so turn on server and then mc
-            if status == "offline":
-                await message.channel.send(f'🖥️ Server is currently **{status}**.')
+                if server.mc_status():
+                    await message.channel.send('🎮 Minecraft server is **online**')
+                else:
+                    # NOTE: server is online, but mc not running, so run mc
+                    # TODO: add protection when user call /start again
+                    await message.channel.send("MC server is booting up...")
+                    server.start_mc() 
+                    return
 
+            else:
+                # NOTE: server is offline, so turn on server and then mc
+                await message.channel.send(f'🖥️ Server is currently **offline**.')
                 async def notify(msg: str):
                     await message.channel.send(msg)
 
                 asyncio.create_task(server.start(status_callback=notify))
                 return 
 
-            # NOTE: server is online, but mc not running, so run mc
-            # TODO: add protection when user call /start again
-            if status == "pc online, mc starting..."
-                await message.channel.send("MC server is booting up...")
-                server.start_mc() 
-                return
-
-            # NOTE: everything running so just print status 
-
-            await message.channel.send(f'🖥️ Server is currently **{status}**.')
-
-
-        # WARN: NOW SHOULD NOT WORK, AND SHOULD DONT RUN
         if user_message.lower() == "/stop":
+            if not is_owner(str(message.author.id)):
+                await message.channel.send("❌ Only the bot owner can stop the server.")
+                return
             await message.channel.send("🛑 Stopping server...")
             server.stop()
             await message.channel.send("✅ Done.")
 
         if user_message.lower() == "/status":
             # show if its online/offline, and uptime, and when will turn off
-            status = server.get_status()
-            await message.channel.send(f'🖥️ Server is currently **{status}**.')
+            if server.get_status():
+                await message.channel.send('🖥️ Server is currently **online**.')
+
+                if server.mc_status():
+                    await message.channel.send('🎮 Minecraft server is **online**')
+                    return
+                else:
+                    await message.channel.send('🎮 Minecraft server is **offline**')
 
         if user_message.lower() == "/players":
-            if not server.is_mc_running():
-                await message.channel.send('❌ Minecraft server is not running.')
-                return
-            players = server.get_players()
-            if players:
-                await message.channel.send(f'👥 Online players: {", ".join(players)}')
+            active_players = server.get_players()
+            if active_players:
+                await message.channel.send(f'Players online: **{len(active_players)}**\n' + '\n'.join(f'• {p}' for p in active_players))
             else:
-                await message.channel.send('👥 No players online or server is offline.')
-
-    # if channel == "server":
-    #     if user_message.lower() == "hello" or user_message.lower() == "hi":
-    #         await message.channel.send(f'Hello {username}')
-    #         return
-    #     elif user_message.lower() == "bye":
-    #         await message.channel.send(f'Bye {username}')
-    #     elif user_message.lower() == "tell me a joke":
-    #         jokes = [" Can someone please shed more\
-    #         light on how my lamp got stolen?",
-    #                  "Why is she called llene? She\
-    #                  stands on equal legs.",
-    #                  "What do you call a gazelle in a \
-    #                  lions territory? Denzel."]
-    #         await message.channel.send(random.choice(jokes))
-
-client.run(DISCORD_TOKEN)
+                await message.channel.send('No players online.')
+if __name__ == "__main__":
+    client.run(DISCORD_TOKEN)
