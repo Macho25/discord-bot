@@ -15,6 +15,7 @@ import ping3
 from datetime import datetime, time
 import wakeonlan
 from logger import log
+import json
 
 with open("/data/mc-server/config.yaml", "r") as f:
     config = yaml.safe_load(f)
@@ -40,9 +41,37 @@ client: discord.Client = discord.Client(intents=intents)
 SCRIPT_DIR: str = config['paths']['scripts']
 
 class Server:
-    # Tracks how many times each user started the server today: {user_id: count}
-    _start_counts: dict[str, int] = {}
+    # Tracks how many times each user started the server today: {user_id: count, date: YYYY-MM-DD}
+    _start_data: dict = {"date": "", "counts": {}}
     MAX_STARTS_PER_DAY: int = config['session']['daily_starts']
+    _counts_file: str = "/data/mc-server/discord-bot/start_counts.json"
+
+    def _load_counts(self) -> None:
+        """Load start counts from file, reset if date has passed."""
+        today = datetime.now().strftime("%Y-%m-%d")
+        try:
+            if os.path.exists(self._counts_file):
+                with open(self._counts_file, "r") as f:
+                    data = json.load(f)
+                if data.get("date") == today:
+                    self._start_data = data
+                else:
+                    # New day, reset counts
+                    self._start_data = {"date": today, "counts": {}}
+                    self._save_counts()
+            else:
+                self._start_data = {"date": today, "counts": {}}
+        except Exception as e:
+            log.error(f"Failed to load start counts: {e}")
+            self._start_data = {"date": today, "counts": {}}
+
+    def _save_counts(self) -> None:
+        """Persist start counts to file."""
+        try:
+            with open(self._counts_file, "w") as f:
+                json.dump(self._start_data, f)
+        except Exception as e:
+            log.error(f"Failed to save start counts: {e}")
 
     # ─── Helpers ────────────────────────────────────────────────────────────────
 
@@ -141,13 +170,15 @@ class Server:
         return [p.strip() for p in output.split("\n") if p.strip()] 
 
     def can_user_start(self, user_id: str) -> bool:
-        count = self._start_counts.get(user_id, 0)
+        self._load_counts()
+        count = self._start_data["counts"].get(user_id, 0)
         return count < self.MAX_STARTS_PER_DAY
 
-        # TODO: this should work before deploying
     def record_start(self, user_id: str) -> None:
+        self._load_counts()
         log.info(f"User {user_id}")
-        self._start_counts[user_id] = self._start_counts.get(user_id, 0) + 1
+        self._start_data["counts"][user_id] = self._start_data["counts"].get(user_id, 0) + 1
+        self._save_counts()
 
     def get_status(self) -> bool:
         if self.is_running():
@@ -174,7 +205,6 @@ class Server:
 
     def start_mc(self) -> None:
         """Kill any existing tmux session and start the MC server via Docker."""
-        # TODO: this should do a script
         docker_start = config['docker']['start_command']
         try:
             result = subprocess.run(
@@ -239,8 +269,12 @@ class Server:
         """Shut down the PC via SSH or a script. Ensures MC is stopped first."""
         if self.is_mc_running():
             self.stop_mc()
-        # TODO: shutdown script
-        self._run_script("shutdown.sh")
+        if config['can_shutdown_pc']:
+            self._run_script("shutdown.sh")
+        else:
+            log.info("PC cannot be shutdowned at the moment")
+            return
+
 
     def stop_mc(self) -> None:
         """Stop only the MC Docker container."""
@@ -317,12 +351,26 @@ async def on_message(message: discord.Message) -> None:
                 asyncio.create_task(server.start(status_callback=notify))
                 return 
 
-        if user_message.lower() == "/stop":
+        if user_message.lower().startswith("/stop"):
             if not is_owner(str(message.author.id)):
                 await message.channel.send("❌ Only the bot owner can stop the server.")
                 return
-            await message.channel.send("🛑 Stopping server...")
-            server.stop()
+            # Parse optional minutes argument
+            parts = user_message.split()
+            minutes_arg = None
+            if len(parts) > 1 and parts[1].isdigit() and int(parts[1]) > 0:
+                minutes_arg = parts[1]
+            if minutes_arg:
+                await message.channel.send(f"🛑 Stopping server in {minutes_arg} minute(s)...")
+                # Run shutdown script in background
+                subprocess.Popen(
+                    ["bash", os.path.join(SCRIPT_DIR, "shutdown.sh"), minutes_arg],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL
+                )
+            else:
+                await message.channel.send("🛑 Stopping server...")
+                server.stop()
             await message.channel.send("✅ Done.")
 
         if user_message.lower() == "/status":

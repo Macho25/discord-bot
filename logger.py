@@ -1,6 +1,7 @@
 import logging
 import inspect
 from enum import IntEnum
+from logging.handlers import RotatingFileHandler
 
 
 class LogLevel(IntEnum):
@@ -21,8 +22,10 @@ class Logger:
             # Console handler
             console_handler = logging.StreamHandler()
             console_handler.setLevel(level)
-            # File handler
-            file_handler = logging.FileHandler("discord-bot.log", encoding="utf-8")
+            # Rotating file handler (10MB per file, keep 5 backups)
+            file_handler = RotatingFileHandler(
+                "discord-bot.log", maxBytes=10*1024*1024, backupCount=5, encoding="utf-8"
+            )
             file_handler.setLevel(level)
             # Formatter
             formatter = logging.Formatter(
