@@ -11,7 +11,6 @@ import routeros_api
 import yaml
 import asyncio
 import socket
-import ping3
 from datetime import datetime, time
 import wakeonlan
 from logger import log
@@ -170,12 +169,14 @@ class Server:
     # ─── Status ─────────────────────────────────────────────────────────────────
 
     def is_running(self) -> bool:
-        """Check if the PC is reachable via ping."""
-        # TODO: this should do a script
+        """Check if server is reachable via TCP (SSH port 22)."""
         host = config['network']['server_local_ip']
         try:
-            response = ping3.ping(host, timeout=2)
-            return response is not None and response is not False
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.settimeout(2)
+            result = sock.connect_ex((host, 22))
+            sock.close()
+            return result == 0
         except Exception as e:
             log.error(f"Excection : {e}")
             return False
