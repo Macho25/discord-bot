@@ -16,6 +16,7 @@ from datetime import datetime, time
 import wakeonlan
 from logger import log
 import json
+import paramiko
 
 with open("/data/mc-server/config.yaml", "r") as f:
     config = yaml.safe_load(f)
@@ -76,6 +77,7 @@ class Server:
     # ─── Helpers ────────────────────────────────────────────────────────────────
 
     def _run_script(self, script_name: str, *args) -> str:
+        """Run a script locally (on the bot VM)."""
         script_path = os.path.join(SCRIPT_DIR, script_name)
         try:
             result = subprocess.run(
@@ -88,6 +90,33 @@ class Server:
         except subprocess.TimeoutExpired:
             return "error: timeout"
         except Exception as e:
+            return f"error: {str(e)}"
+
+    def _run_remote_script(self, script_name: str, *args) -> str:
+        """Run a script on the MC server machine via SSH."""
+        ssh_conf = config.get('ssh', {})
+        host = ssh_conf.get('host', config['network']['server_local_ip'])
+        user = ssh_conf.get('user', 'macho25')
+        key_path = ssh_conf.get('key_path')
+        remote_dir = ssh_conf.get('scripts_dir', '/data/mc-server/scripts')
+        
+        remote_cmd = f"bash {remote_dir}/{script_name} {' '.join(args)}"
+        
+        try:
+            ssh = paramiko.SSHClient()
+            ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+            ssh.connect(host, username=user, key_filename=key_path, timeout=10)
+            
+            stdin, stdout, stderr = ssh.exec_command(remote_cmd, timeout=30)
+            output = stdout.read().decode('utf-8').strip()
+            error = stderr.read().decode('utf-8').strip()
+            ssh.close()
+            
+            if error:
+                log.error(f"SSH script error: {error}")
+            return output or error
+        except Exception as e:
+            log.error(f"SSH error: {e}")
             return f"error: {str(e)}"
 
     def _rcon(self, command: str) -> str:
@@ -154,7 +183,7 @@ class Server:
     def is_mc_running(self) -> bool:
         """Check if the Minecraft server is accepting connections on its port."""
         try:
-            if self._run_script("mc-status.sh") == "Online":
+            if self._run_remote_script("mc-status.sh") == "Online":
                 return True
             else:
                 return False
@@ -164,7 +193,7 @@ class Server:
             return False
 
     def get_players(self) -> list[str]:
-        output = self._run_script("get-players.sh")
+        output = self._run_remote_script("get-players.sh")
         if not output or output.startswith("error"):
             return []
         return [p.strip() for p in output.split("\n") if p.strip()] 
@@ -205,25 +234,12 @@ class Server:
 
     def start_mc(self) -> None:
         """Kill any existing tmux session and start the MC server via Docker."""
-        docker_start = config['docker']['start_command']
         try:
-            result = subprocess.run(
-                docker_start,
-                shell=True,
-                timeout=30,
-                capture_output=True,
-                text=True
-            )
-            
-            if result.returncode == 0:
-                log.info("✅ MC server started successfully")
+            output = self._run_remote_script("start-mc.sh")
+            if "error" in output.lower():
+                log.error(f"❌ MC start failed: {output}")
             else:
-                log.error(f"❌ Command failed with exit code {result.returncode}")
-                log.error(f"stdout: {result.stdout}")
-                log.error(f"stderr: {result.stderr}")
-                
-        except subprocess.TimeoutExpired:
-            log.error("❌ Start command timed out after 30s")
+                log.info("✅ MC server started successfully")
         except Exception as e:
             log.error(f"❌ Failed to start MC: {e}")
 
@@ -269,19 +285,17 @@ class Server:
         """Shut down the PC via SSH or a script. Ensures MC is stopped first."""
         if self.is_mc_running():
             self.stop_mc()
-        if config['can_shutdown_pc']:
-            self._run_script("shutdown.sh")
+        if config.get('can_shutdown_pc', False):
+            self._run_remote_script("shutdown.sh")
         else:
             log.info("PC cannot be shutdowned at the moment")
             return
 
 
     def stop_mc(self) -> None:
-        """Stop only the MC Docker container."""
-        # TODO: make a script for it
-        docker_stop = config['docker']['stop_command']
+        """Stop only the MC Docker container via SSH script."""
         try:
-            subprocess.run(docker_stop, shell=True, timeout=60)
+            self._run_remote_script("stop-mc.sh")
         except Exception as e:
             log.error(f"❌ Failed to stop MC: {e}")
 
@@ -362,12 +376,8 @@ async def on_message(message: discord.Message) -> None:
                 minutes_arg = parts[1]
             if minutes_arg:
                 await message.channel.send(f"🛑 Stopping server in {minutes_arg} minute(s)...")
-                # Run shutdown script in background
-                subprocess.Popen(
-                    ["bash", os.path.join(SCRIPT_DIR, "shutdown.sh"), minutes_arg],
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL
-                )
+                # Run shutdown script on server via SSH in background
+                asyncio.create_task(server._run_remote_script("shutdown.sh", minutes_arg))
             else:
                 await message.channel.send("🛑 Stopping server...")
                 server.stop()
